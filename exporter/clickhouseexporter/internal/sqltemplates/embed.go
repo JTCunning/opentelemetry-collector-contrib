@@ -121,3 +121,14 @@ var MetricsSummaryCreateTable string
 
 //go:embed metrics_summary_insert.sql
 var MetricsSummaryInsert string
+
+// METRICS (TimeSeries engine schema)
+
+//go:embed metrics_timeseries_table.sql
+var MetricsTimeSeriesCreateTable string
+
+//go:embed metrics_timeseries_insert.sql
+var MetricsTimeSeriesInsert string
+
+//go:embed metrics_timeseries_meta_insert.sql
+var MetricsTimeSeriesMetaInsert string

@@ -22,6 +22,9 @@ type metricsExporter struct {
 	logger       *zap.Logger
 	cfg          *Config
 	tablesConfig metrics.MetricTablesConfigMapper
+	// tsModel is set when the "timeseries" metrics schema is configured; it
+	// replaces the per-type wide-table models.
+	tsModel *metrics.TimeSeriesModel
 }
 
 func newMetricsExporter(logger *zap.Logger, cfg *Config) *metricsExporter {
@@ -47,6 +50,10 @@ func (e *metricsExporter) start(ctx context.Context, _ component.Host) error {
 		return err
 	}
 
+	if e.cfg.metricsSchema() == schemaTimeSeries {
+		e.tsModel = metrics.NewTimeSeriesModel(e.cfg.database(), e.cfg.MetricsTimeSeriesTableName)
+	}
+
 	if e.cfg.shouldCreateSchema() {
 		database := e.cfg.database()
 		clusterStr := e.cfg.clusterString()
@@ -54,9 +61,23 @@ func (e *metricsExporter) start(ctx context.Context, _ component.Host) error {
 			return err
 		}
 
-		ttlExpr := internal.GenerateTTLExpr(e.cfg.TTL, "toDateTime(TimeUnix)")
-		err := metrics.NewMetricsTable(ctx, e.tablesConfig, database, clusterStr, e.cfg.tableEngineString(), ttlExpr, e.db)
-		if err != nil {
+		if e.tsModel != nil {
+			if err := metrics.NewTimeSeriesTable(ctx, database, e.cfg.MetricsTimeSeriesTableName, clusterStr, e.db); err != nil {
+				return err
+			}
+		} else {
+			ttlExpr := internal.GenerateTTLExpr(e.cfg.TTL, "toDateTime(TimeUnix)")
+			err := metrics.NewMetricsTable(ctx, e.tablesConfig, database, clusterStr, e.cfg.tableEngineString(), ttlExpr, e.db)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	if e.tsModel != nil {
+		// The TimeSeries outer column layout differs across ClickHouse
+		// versions; inspect the table to pick the right insert shape.
+		if err := e.tsModel.DetectSchema(ctx, e.db); err != nil {
 			return err
 		}
 	}
@@ -84,6 +105,10 @@ func (e *metricsExporter) shutdown(_ context.Context) error {
 }
 
 func (e *metricsExporter) pushMetricsData(ctx context.Context, md pmetric.Metrics) error {
+	if e.tsModel != nil {
+		return e.tsModel.Insert(ctx, e.db, md)
+	}
+
 	metricsMap := metrics.NewMetricsModel(e.tablesConfig, e.cfg.database())
 	for i := 0; i < md.ResourceMetrics().Len(); i++ {
 		metrics := md.ResourceMetrics().At(i)

@@ -87,7 +87,9 @@ func TestLoadConfig(t *testing.T) {
 					queue.StorageID = &storageID
 					return queue
 				}()),
-				AsyncInsert: true,
+				AsyncInsert:                true,
+				MetricsSchema:              schemaOTel,
+				MetricsTimeSeriesTableName: defaultMetricTableName,
 				TLS: configtls.ClientConfig{
 					Config: configtls.Config{
 						CertFile: "client.crt",

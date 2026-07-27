@@ -63,6 +63,15 @@ properties:
   metrics_tables:
     description: MetricsTables defines the table names for metric types.
     $ref: metric_tables_config
+  metrics_schema:
+    description: 'MetricsSchema selects the metrics storage schema. "otel" (default) writes each metric type to its own wide MergeTree table (see MetricsTables). "timeseries" converts metrics to the Prometheus data model and writes them to a single TimeSeries engine table (experimental in ClickHouse; requires ClickHouse 26.6+ and allow_experimental_time_series_table on the server for table creation). The `ttl`, `table_engine`, and `metrics_tables` options do not apply to the "timeseries" schema.'
+    type: string
+  metrics_timeseries_table_name:
+    description: MetricsTimeSeriesTableName is the TimeSeries engine table name used when MetricsSchema is "timeseries". default is `otel_metrics`.
+    type: string
+  resource_to_telemetry_conversion:
+    description: ResourceToTelemetrySettings, when enabled, copies resource attributes to datapoint attributes before export. Most useful with the "timeseries" metrics schema, where datapoint attributes become Prometheus labels and resource attributes would otherwise only be represented by job/instance and the target_info series.
+    $ref: /pkg/resourcetotelemetry.settings
   password:
     description: Password is the authentication password.
     $ref: go.opentelemetry.io/collector/config/configopaque.string

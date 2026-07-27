@@ -15,6 +15,7 @@ import (
 	"go.opentelemetry.io/collector/exporter/xexporter"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/clickhouseexporter/internal/metadata"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/resourcetotelemetry"
 )
 
 // NewFactory creates a factory for the ClickHouse exporter.
@@ -117,7 +118,7 @@ func createMetricExporter(
 	c.collectorVersion = set.BuildInfo.Version
 	exp := newMetricsExporter(set.Logger, c)
 
-	return exporterhelper.NewMetrics(
+	metricsExp, err := exporterhelper.NewMetrics(
 		ctx,
 		set,
 		cfg,
@@ -128,4 +129,9 @@ func createMetricExporter(
 		exporterhelper.WithQueue(c.QueueSettings),
 		exporterhelper.WithRetry(c.BackOffConfig),
 	)
+	if err != nil {
+		return nil, err
+	}
+
+	return resourcetotelemetry.WrapMetricsExporter(c.ResourceToTelemetrySettings, metricsExp), nil
 }

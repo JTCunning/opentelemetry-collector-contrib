@@ -297,6 +297,60 @@ limit 100
 The OTLP Metrics [define two type value for one datapoint](https://github.com/open-telemetry/opentelemetry-proto/blob/main/opentelemetry/proto/metrics/v1/metrics.proto#L358),
 clickhouse only use one value of float64 to store them.
 
+### Metrics: TimeSeries engine schema (experimental)
+
+> [!IMPORTANT]
+> The `timeseries` metrics schema targets ClickHouse's experimental
+> [TimeSeries table engine](https://clickhouse.com/docs/engines/table-engines/special/time-series).
+> Direct INSERT into TimeSeries tables requires ClickHouse 26.6 or newer, and table creation
+> requires `allow_experimental_time_series_table` on the server. The engine's schema may change
+> in backwards-incompatible ways.
+
+Setting `metrics_schema: timeseries` replaces the five wide per-type tables with a single
+TimeSeries engine table (`metrics_timeseries_table_name`, default `otel_metrics`). Metrics are
+converted to the Prometheus data model with the same translation the `prometheusremotewrite`
+exporter uses, then inserted natively through the table's outer columns
+(`metric_name`, `tags`, `time_series`), plus metric-family metadata
+(`metric_family`, `type`, `unit`, `help`).
+
+The conversion follows Prometheus semantics:
+
+- Metric names are normalized with unit and `_total` suffixes; histograms decompose into
+  `_bucket`/`_sum`/`_count` series and summaries into quantile series.
+- Resource attributes are represented by the `job`/`instance` labels and a `target_info` series.
+  Enable `resource_to_telemetry_conversion` to copy resource attributes onto every series as labels.
+- Data can be read back with PromQL via ClickHouse's `prometheusQuery()` table function, the
+  Prometheus HTTP API endpoints, or the `timeSeriesData`/`timeSeriesTags`/`timeSeriesMetrics`
+  table functions. Direct `SELECT` on a TimeSeries table is not supported by ClickHouse.
+
+Data lost or approximated relative to the default `otel` schema:
+
+| OTel concept | Fate in the `timeseries` schema |
+| --- | --- |
+| Exponential histograms | Dropped (Prometheus native histograms cannot be stored as float samples); convert to explicit-bucket histograms upstream, e.g. the `transform` processor's `convert_exponential_histogram_to_histogram` |
+| Delta temporality | Dropped by the translator; use the `deltatocumulative` processor upstream |
+| Exemplars | Dropped (no exemplar storage in the engine) |
+| Integer datapoints | Converted to float64 |
+| Start timestamps, schema URLs, scope metadata | Not stored (scope name/version survive as `otel_scope_*` labels) |
+| Timestamps | Millisecond precision |
+
+The `ttl`, `table_engine`, and `metrics_tables` options do not apply to this schema. To customize
+the TimeSeries table (inner engines, `tags_to_columns`, TTL on inner tables, replication), create
+the table yourself and set `create_schema: false`.
+
+Example:
+
+```yaml
+exporters:
+  clickhouse:
+    endpoint: tcp://127.0.0.1:9000?dial_timeout=10s
+    database: otel
+    metrics_schema: timeseries
+    metrics_timeseries_table_name: otel_metrics
+    resource_to_telemetry_conversion:
+      enabled: true
+```
+
 ### Profiles
 
 > [!IMPORTANT]
@@ -384,6 +438,16 @@ ClickHouse tables:
         - `name` (default = "otel_metrics_histogram")
     - `exponential_histogram`
         - `name` (default = "otel_metrics_exp_histogram")
+- `metrics_schema` (default = otel): The metrics storage schema. `otel` writes each metric type to
+  its own wide MergeTree table (see `metrics_tables`). `timeseries` converts metrics to the
+  Prometheus data model and writes them to a single TimeSeries engine table; see the
+  "Metrics: TimeSeries engine schema" section above.
+- `metrics_timeseries_table_name` (default = otel_metrics): The TimeSeries engine table name used
+  when `metrics_schema` is `timeseries`.
+- `resource_to_telemetry_conversion`
+    - `enabled` (default = false): Copies resource attributes to datapoint attributes before export.
+      Most useful with the `timeseries` metrics schema, where datapoint attributes become
+      Prometheus labels.
 
 Cluster definition:
 

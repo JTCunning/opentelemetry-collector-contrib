@@ -21,6 +21,7 @@ import (
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/clickhouseexporter/internal"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/clickhouseexporter/internal/metrics"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/resourcetotelemetry"
 )
 
 // Config defines configuration for clickhouse exporter.
@@ -77,6 +78,23 @@ type Config struct {
 	JSON bool `mapstructure:"json"`
 	// MetricsTables defines the table names for metric types.
 	MetricsTables MetricTablesConfig `mapstructure:"metrics_tables"`
+	// MetricsSchema selects the metrics storage schema.
+	// "otel" (default) writes each metric type to its own wide MergeTree table (see MetricsTables).
+	// "timeseries" converts metrics to the Prometheus data model and writes them to a single
+	// TimeSeries engine table (experimental in ClickHouse; requires
+	// allow_experimental_time_series_table on the server for table creation).
+	// The `ttl`, `table_engine`, and `metrics_tables` options do not apply to the
+	// "timeseries" schema.
+	MetricsSchema string `mapstructure:"metrics_schema"`
+	// MetricsTimeSeriesTableName is the TimeSeries engine table name used when
+	// MetricsSchema is "timeseries". default is `otel_metrics`.
+	MetricsTimeSeriesTableName string `mapstructure:"metrics_timeseries_table_name"`
+	// ResourceToTelemetrySettings, when enabled, copies resource attributes to
+	// datapoint attributes before export. Most useful with the "timeseries"
+	// metrics schema, where datapoint attributes become Prometheus labels and
+	// resource attributes would otherwise only be represented by job/instance
+	// and the target_info series.
+	ResourceToTelemetrySettings resourcetotelemetry.Settings `mapstructure:"resource_to_telemetry_conversion"`
 }
 
 type MetricTablesConfig struct {
@@ -107,6 +125,11 @@ const (
 	defaultSummarySuffix      = "_summary"
 	defaultHistogramSuffix    = "_histogram"
 	defaultExpHistogramSuffix = "_exponential_histogram"
+
+	// schemaOTel is the default metrics schema: one wide MergeTree table per metric type.
+	schemaOTel = "otel"
+	// schemaTimeSeries writes metrics to a single ClickHouse TimeSeries engine table.
+	schemaTimeSeries = "timeseries"
 )
 
 var (
@@ -118,17 +141,19 @@ func createDefaultConfig() component.Config {
 	return &Config{
 		collectorVersion: "unknown",
 
-		TimeoutSettings:   exporterhelper.NewDefaultTimeoutConfig(),
-		QueueSettings:     configoptional.Some(exporterhelper.NewDefaultQueueConfig()),
-		BackOffConfig:     configretry.NewDefaultBackOffConfig(),
-		ConnectionParams:  map[string]string{},
-		Database:          defaultDatabase,
-		LogsTableName:     "otel_logs",
-		TracesTableName:   "otel_traces",
-		ProfilesTableName: "otel_profiles",
-		TTL:               0,
-		CreateSchema:      true,
-		AsyncInsert:       true,
+		TimeoutSettings:            exporterhelper.NewDefaultTimeoutConfig(),
+		QueueSettings:              configoptional.Some(exporterhelper.NewDefaultQueueConfig()),
+		BackOffConfig:              configretry.NewDefaultBackOffConfig(),
+		ConnectionParams:           map[string]string{},
+		Database:                   defaultDatabase,
+		LogsTableName:              "otel_logs",
+		TracesTableName:            "otel_traces",
+		ProfilesTableName:          "otel_profiles",
+		TTL:                        0,
+		CreateSchema:               true,
+		AsyncInsert:                true,
+		MetricsSchema:              schemaOTel,
+		MetricsTimeSeriesTableName: defaultMetricTableName,
 		MetricsTables: MetricTablesConfig{
 			Gauge:                metrics.MetricTypeConfig{Name: defaultMetricTableName + defaultGaugeSuffix},
 			Sum:                  metrics.MetricTypeConfig{Name: defaultMetricTableName + defaultSumSuffix},
@@ -148,6 +173,12 @@ func (cfg *Config) Validate() (err error) {
 	dsn, e := cfg.buildDSN()
 	if e != nil {
 		err = errors.Join(err, e)
+	}
+
+	switch cfg.MetricsSchema {
+	case "", schemaOTel, schemaTimeSeries:
+	default:
+		err = errors.Join(err, fmt.Errorf("unknown metrics_schema %q, valid values: %q, %q", cfg.MetricsSchema, schemaOTel, schemaTimeSeries))
 	}
 
 	cfg.buildMetricTableNames()
@@ -239,6 +270,14 @@ func (cfg *Config) buildClickHouseOptions() (*clickhouse.Options, error) {
 // shouldCreateSchema returns true if the exporter should run the DDL for creating database/tables.
 func (cfg *Config) shouldCreateSchema() bool {
 	return cfg.CreateSchema
+}
+
+// metricsSchema returns the effective metrics schema, defaulting to "otel".
+func (cfg *Config) metricsSchema() string {
+	if cfg.MetricsSchema == "" {
+		return schemaOTel
+	}
+	return cfg.MetricsSchema
 }
 
 func (cfg *Config) buildMetricTableNames() {
