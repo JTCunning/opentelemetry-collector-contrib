@@ -6,6 +6,7 @@ package clickhouseexporter
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"testing"
 	"time"
 
@@ -14,8 +15,11 @@ import (
 	"github.com/ClickHouse/clickhouse-go/v2/lib/proto"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.uber.org/zap"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/clickhouseexporter/internal/metrics"
 )
 
 // noopBatch implements driver.Batch but discards all data.
@@ -227,4 +231,135 @@ func BenchmarkPushTraceData(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// BenchmarkPushMetricsData compares the collector cost of the otel and
+// timeseries metrics schemas. The batch is discarded by noopConn.
+func BenchmarkPushMetricsData(b *testing.B) {
+	md, datapoints := realisticMetrics(20)
+	metrics.SetLogger(zap.NewNop())
+
+	for _, schema := range []string{schemaOTel, schemaTimeSeries} {
+		b.Run("schema="+schema, func(b *testing.B) {
+			cfg := withDefaultConfig(func(cfg *Config) {
+				cfg.MetricsSchema = schema
+			})
+			exp := &metricsExporter{
+				db:           noopConn{},
+				logger:       zap.NewNop(),
+				cfg:          cfg,
+				tablesConfig: generateMetricTablesConfigMapper(cfg),
+			}
+			if schema == schemaTimeSeries {
+				exp.tsModel = metrics.NewTimeSeriesModel(cfg.database(), cfg.MetricsTimeSeriesTableName)
+				exp.tsModel.SetColumns(metrics.SamplesColumn, metrics.MetricFamilyColumn)
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			var before, after runtimeMem
+			before = readAllocs()
+			for b.Loop() {
+				if err := exp.pushMetricsData(b.Context(), md); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+			after = readAllocs()
+			perCall := float64(b.N * datapoints)
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/perCall, "ns/datapoint")
+			b.ReportMetric(float64(after.bytes-before.bytes)/perCall, "B/datapoint")
+		})
+	}
+}
+
+type runtimeMem struct {
+	bytes uint64
+}
+
+func readAllocs() runtimeMem {
+	var stats runtime.MemStats
+	runtime.ReadMemStats(&stats)
+	return runtimeMem{bytes: stats.TotalAlloc}
+}
+
+// realisticMetrics builds one gauge, sum, histogram, summary, and exponential
+// histogram per service. The returned count is the number of OTel datapoints.
+func realisticMetrics(services int) (pmetric.Metrics, int) {
+	md := pmetric.NewMetrics()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	for s := range services {
+		rm := md.ResourceMetrics().AppendEmpty()
+		res := rm.Resource().Attributes()
+		res.PutStr("service.name", fmt.Sprintf("service-%d", s))
+		res.PutStr("service.version", "1.2.3")
+		res.PutStr("service.instance.id", fmt.Sprintf("instance-%d", s))
+		res.PutStr("host.name", fmt.Sprintf("host-%d.example.com", s))
+		res.PutStr("deployment.environment", "production")
+
+		sm := rm.ScopeMetrics().AppendEmpty()
+		sm.Scope().SetName("bench-scope")
+		sm.Scope().SetVersion("v1")
+
+		gauge := sm.Metrics().AppendEmpty()
+		gauge.SetName("bench.temperature")
+		gauge.SetUnit("Cel")
+		gaugeDP := gauge.SetEmptyGauge().DataPoints().AppendEmpty()
+		gaugeDP.SetTimestamp(pcommon.NewTimestampFromTime(now))
+		gaugeDP.SetDoubleValue(21.5)
+		gaugeDP.Attributes().PutStr("room", "lab")
+		gaugeDP.Attributes().PutStr("sensor", fmt.Sprintf("sensor-%d", s%4))
+
+		sum := sm.Metrics().AppendEmpty()
+		sum.SetName("bench.requests")
+		sum.SetUnit("1")
+		sumData := sum.SetEmptySum()
+		sumData.SetIsMonotonic(true)
+		sumData.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+		sumDP := sumData.DataPoints().AppendEmpty()
+		sumDP.SetTimestamp(pcommon.NewTimestampFromTime(now))
+		sumDP.SetIntValue(int64(1000 + s))
+		sumDP.Attributes().PutStr("method", "GET")
+
+		hist := sm.Metrics().AppendEmpty()
+		hist.SetName("bench.latency")
+		hist.SetUnit("s")
+		histData := hist.SetEmptyHistogram()
+		histData.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+		histDP := histData.DataPoints().AppendEmpty()
+		histDP.SetTimestamp(pcommon.NewTimestampFromTime(now))
+		histDP.SetCount(8)
+		histDP.SetSum(1.2)
+		histDP.ExplicitBounds().FromRaw([]float64{0.1, 0.5, 1})
+		histDP.BucketCounts().FromRaw([]uint64{2, 3, 2, 1})
+		histDP.Attributes().PutStr("route", "/api")
+
+		summary := sm.Metrics().AppendEmpty()
+		summary.SetName("bench.payload")
+		summary.SetUnit("By")
+		summaryDP := summary.SetEmptySummary().DataPoints().AppendEmpty()
+		summaryDP.SetTimestamp(pcommon.NewTimestampFromTime(now))
+		summaryDP.SetCount(4)
+		summaryDP.SetSum(4000)
+		q50 := summaryDP.QuantileValues().AppendEmpty()
+		q50.SetQuantile(0.5)
+		q50.SetValue(800)
+		q99 := summaryDP.QuantileValues().AppendEmpty()
+		q99.SetQuantile(0.99)
+		q99.SetValue(1500)
+
+		expHist := sm.Metrics().AppendEmpty()
+		expHist.SetName("bench.exp.latency")
+		expHist.SetUnit("s")
+		expData := expHist.SetEmptyExponentialHistogram()
+		expData.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+		expDP := expData.DataPoints().AppendEmpty()
+		expDP.SetTimestamp(pcommon.NewTimestampFromTime(now))
+		expDP.SetScale(2)
+		expDP.SetCount(2)
+		expDP.SetSum(0.4)
+		expDP.Positive().SetOffset(0)
+		expDP.Positive().BucketCounts().FromRaw([]uint64{1, 1})
+	}
+	return md, services * 5
 }
