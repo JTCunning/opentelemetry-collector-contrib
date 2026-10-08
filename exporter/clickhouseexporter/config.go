@@ -81,8 +81,8 @@ type Config struct {
 	// MetricsSchema selects the metrics storage schema.
 	// "otel" (default) writes each metric type to its own wide MergeTree table (see MetricsTables).
 	// "timeseries" converts metrics to the Prometheus data model and writes them to a single
-	// TimeSeries engine table (experimental in ClickHouse; requires
-	// allow_experimental_time_series_table on the server for table creation).
+	// TimeSeries engine table (private preview in ClickHouse; requires ClickHouse 26.6+ and
+	// enable_time_series_table on the server for table creation).
 	// The `ttl`, `table_engine`, and `metrics_tables` options do not apply to the
 	// "timeseries" schema.
 	MetricsSchema string `mapstructure:"metrics_schema"`

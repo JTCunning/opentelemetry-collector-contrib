@@ -1,51 +1,51 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//go:build timeseries_smoke
+//go:build integration
 
-// Temporary live smoke test for the TimeSeries metrics schema. Run with:
-//
-//	go test -count=1 -tags timeseries_smoke -run TestTimeSeriesSchemaSmoke -v .
-//
-// Requires a ClickHouse server with TimeSeries engine support on
-// CLICKHOUSE_TS_SMOKE_ENDPOINT (default tcp://127.0.0.1:19000).
 package clickhouseexporter
 
 import (
 	"context"
-	"os"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/collector/exporter/exportertest"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.uber.org/zap/zaptest"
 )
 
-func TestTimeSeriesSchemaSmoke(t *testing.T) {
-	endpoint := os.Getenv("CLICKHOUSE_TS_SMOKE_ENDPOINT")
-	if endpoint == "" {
-		endpoint = "tcp://127.0.0.1:19000"
-	}
+func TestTimeSeriesSchema(t *testing.T) {
+	container, chEnv, err := createClickhouseContainer("clickhouse/clickhouse-server:26.9-alpine")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := container.Terminate(ctx); err != nil {
+			t.Logf("terminate container: %v", err)
+		}
+	})
 
-	ctx := context.Background()
+	endpoint := strings.Replace(chEnv.NativeEndpoint, "database=otel_int_test", "database=default", 1)
+	const database = "otel_ts_schema"
 
-	cfg := createDefaultConfig().(*Config)
-	cfg.Endpoint = endpoint
-	cfg.Database = "otel_ts_smoke"
-	cfg.MetricsSchema = "timeseries"
-	cfg.MetricsTimeSeriesTableName = "otel_metrics"
-
+	cfg := withDefaultConfig(func(cfg *Config) {
+		cfg.Endpoint = endpoint
+		cfg.Database = database
+		cfg.MetricsSchema = schemaTimeSeries
+		cfg.MetricsTimeSeriesTableName = "otel_metrics"
+	})
 	require.NoError(t, cfg.Validate())
 
-	exp := newMetricsExporter(exportertest.NewNopSettings(exportertest.NopType).Logger, cfg)
-	require.NoError(t, exp.start(ctx, nil))
-	defer func() { require.NoError(t, exp.shutdown(ctx)) }()
+	exp := newMetricsExporter(zaptest.NewLogger(t), cfg)
+	require.NoError(t, exp.start(t.Context(), nil))
+	t.Cleanup(func() {
+		require.NoError(t, exp.shutdown(t.Context()))
+	})
 
-	// Fixture: gauge + monotonic sum + classic histogram + metadata.
 	ts := time.Now().UTC().Truncate(time.Millisecond)
 	md := pmetric.NewMetrics()
 	rm := md.ResourceMetrics().AppendEmpty()
@@ -82,22 +82,15 @@ func TestTimeSeriesSchemaSmoke(t *testing.T) {
 	histDP.ExplicitBounds().FromRaw([]float64{0.1, 1})
 	histDP.BucketCounts().FromRaw([]uint64{1, 1, 1})
 
-	require.NoError(t, exp.pushMetricsData(ctx, md))
-
-	// Read back through the TimeSeries table functions.
-	opts, err := clickhouse.ParseDSN(endpoint + "/" + cfg.Database)
-	require.NoError(t, err)
-	conn, err := clickhouse.Open(opts)
-	require.NoError(t, err)
-	defer conn.Close()
+	require.NoError(t, exp.pushMetricsData(t.Context(), md))
 
 	var tagRows []struct {
 		MetricName string            `ch:"metric_name"`
 		Tags       map[string]string `ch:"tags"`
 	}
-	require.NoError(t, conn.Select(ctx,
+	require.NoError(t, exp.db.Select(t.Context(),
 		&tagRows,
-		"SELECT metric_name, tags FROM timeSeriesTags(otel_ts_smoke.otel_metrics) ORDER BY metric_name",
+		"SELECT metric_name, tags FROM timeSeriesTags("+database+".otel_metrics) ORDER BY metric_name",
 	))
 
 	names := make(map[string]map[string]string, len(tagRows))
@@ -116,7 +109,7 @@ func TestTimeSeriesSchemaSmoke(t *testing.T) {
 	assert.Equal(t, "smoke-service", names["smoke_temperature"]["job"])
 
 	var sampleCount uint64
-	row := conn.QueryRow(ctx, "SELECT count() FROM timeSeriesData(otel_ts_smoke.otel_metrics)")
+	row := exp.db.QueryRow(t.Context(), "SELECT count() FROM timeSeriesData("+database+".otel_metrics)")
 	require.NoError(t, row.Scan(&sampleCount))
 	// gauge(1) + sum(1) + histogram bucket(3)+sum(1)+count(1) + target_info(1) = 8
 	assert.Equal(t, uint64(8), sampleCount, "expected 8 samples")
@@ -127,9 +120,9 @@ func TestTimeSeriesSchemaSmoke(t *testing.T) {
 		Unit   string `ch:"unit"`
 		Help   string `ch:"help"`
 	}
-	require.NoError(t, conn.Select(ctx,
+	require.NoError(t, exp.db.Select(t.Context(),
 		&metaRows,
-		"SELECT metric_family_name, type, unit, help FROM timeSeriesMetrics(otel_ts_smoke.otel_metrics) ORDER BY metric_family_name",
+		"SELECT metric_family_name, type, unit, help FROM timeSeriesMetrics("+database+".otel_metrics) ORDER BY metric_family_name",
 	))
 	metaByFamily := make(map[string]string, len(metaRows))
 	helpByFamily := make(map[string]string, len(metaRows))

@@ -64,7 +64,7 @@ properties:
     description: MetricsTables defines the table names for metric types.
     $ref: metric_tables_config
   metrics_schema:
-    description: 'MetricsSchema selects the metrics storage schema. "otel" (default) writes each metric type to its own wide MergeTree table (see MetricsTables). "timeseries" converts metrics to the Prometheus data model and writes them to a single TimeSeries engine table (experimental in ClickHouse; requires ClickHouse 26.6+ and allow_experimental_time_series_table on the server for table creation). The `ttl`, `table_engine`, and `metrics_tables` options do not apply to the "timeseries" schema.'
+    description: 'MetricsSchema selects the metrics storage schema. "otel" (default) writes each metric type to its own wide MergeTree table (see MetricsTables). "timeseries" converts metrics to the Prometheus data model and writes them to a single TimeSeries engine table (private preview in ClickHouse; requires ClickHouse 26.6+ and enable_time_series_table on the server for table creation). The `ttl`, `table_engine`, and `metrics_tables` options do not apply to the "timeseries" schema.'
     type: string
   metrics_timeseries_table_name:
     description: MetricsTimeSeriesTableName is the TimeSeries engine table name used when MetricsSchema is "timeseries". default is `otel_metrics`.

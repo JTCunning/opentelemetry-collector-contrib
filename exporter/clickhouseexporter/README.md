@@ -297,21 +297,24 @@ limit 100
 The OTLP Metrics [define two type value for one datapoint](https://github.com/open-telemetry/opentelemetry-proto/blob/main/opentelemetry/proto/metrics/v1/metrics.proto#L358),
 clickhouse only use one value of float64 to store them.
 
-### Metrics: TimeSeries engine schema (experimental)
+### Metrics: TimeSeries engine schema (private preview)
 
 > [!IMPORTANT]
-> The `timeseries` metrics schema targets ClickHouse's experimental
-> [TimeSeries table engine](https://clickhouse.com/docs/engines/table-engines/special/time-series).
-> Direct INSERT into TimeSeries tables requires ClickHouse 26.6 or newer, and table creation
-> requires `allow_experimental_time_series_table` on the server. The engine's schema may change
-> in backwards-incompatible ways.
+> The `timeseries` metrics schema targets ClickHouse's
+> [TimeSeries table engine](https://clickhouse.com/docs/engines/table-engines/special/time-series),
+> which is a private preview feature. Direct INSERT into TimeSeries tables requires ClickHouse
+> 26.6 or newer. Table creation requires the engine to be enabled on the server: the exporter
+> sets `enable_time_series_table` (ClickHouse 26.9+) or `allow_experimental_time_series_table`
+> (26.6 to 26.8) for the `CREATE TABLE` statement. The engine's schema is versioned and may change
+> in backwards-incompatible ways; the exporter is tested against ClickHouse 26.9.
 
 Setting `metrics_schema: timeseries` replaces the five wide per-type tables with a single
 TimeSeries engine table (`metrics_timeseries_table_name`, default `otel_metrics`). Metrics are
-converted to the Prometheus data model with the same translation the `prometheusremotewrite`
-exporter uses, then inserted natively through the table's outer columns
-(`metric_name`, `tags`, `time_series`), plus metric-family metadata
-(`metric_family`, `type`, `unit`, `help`).
+converted to the Prometheus data model (metric name, labels, and float samples), then inserted
+natively through the table's outer columns
+(`metric_name`, `tags`, `samples`), plus metric-family metadata
+(`metric_family`, `type`, `unit`, `help`). The exporter inspects the table at startup and also
+accepts the `time_series` samples column of tables created with schema version 2 or earlier.
 
 The conversion follows Prometheus semantics:
 
@@ -337,6 +340,20 @@ Data lost or approximated relative to the default `otel` schema:
 The `ttl`, `table_engine`, and `metrics_tables` options do not apply to this schema. To customize
 the TimeSeries table (inner engines, `tags_to_columns`, TTL on inner tables, replication), create
 the table yourself and set `create_schema: false`.
+
+Collector-side cost of the two metrics schemas can be compared with the benchmarks in this module.
+`BenchmarkPushMetricsData` measures the conversion and batch-append path without a server:
+
+```sh
+go test -run '^$' -bench BenchmarkPushMetricsData -benchmem ./exporter/clickhouseexporter/
+```
+
+`TestMetricsSchemaBenchmark` pushes the same batches to a ClickHouse container with each schema
+and logs wall time, process CPU time, Go allocations, and peak RSS:
+
+```sh
+go test -count=1 -tags integration -run TestMetricsSchemaBenchmark -v ./exporter/clickhouseexporter/
+```
 
 Example:
 
