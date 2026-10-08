@@ -43,7 +43,7 @@ func NewTimeSeriesTable(ctx context.Context, database, tableName, clusterStr str
 // TimeSeriesModel converts OTel metrics to the Prometheus data model (via the
 // prometheusremotewrite translator) and inserts them into a ClickHouse
 // TimeSeries engine table through its outer insert columns:
-// (metric_name, tags, time_series) for samples and
+// (metric_name, tags, samples|time_series) for samples and
 // (metric_family, type, unit, help) for metric metadata.
 //
 // Direct INSERT into TimeSeries tables requires ClickHouse 26.6+. Older
@@ -84,14 +84,18 @@ func (m *TimeSeriesModel) DetectSchema(ctx context.Context, db driver.Conn) erro
 		columnSet[column] = struct{}{}
 	}
 
+	samplesColumn := ""
 	switch {
+	case hasColumn(columnSet, "samples"):
+		samplesColumn = "samples"
 	case hasColumn(columnSet, "time_series"):
-		m.insertSQL = fmt.Sprintf(sqltemplates.MetricsTimeSeriesInsert, m.database, m.tableName)
+		samplesColumn = "time_series"
 	case hasColumn(columnSet, "timestamp") && hasColumn(columnSet, "value"):
 		return fmt.Errorf("table %q.%q has the pre-26.6 TimeSeries column layout; direct INSERT into TimeSeries tables requires ClickHouse 26.6 or newer", m.database, m.tableName)
 	default:
-		return fmt.Errorf("table %q.%q does not look like a TimeSeries table: no time_series column found", m.database, m.tableName)
+		return fmt.Errorf("table %q.%q does not look like a TimeSeries table: no samples or time_series column found", m.database, m.tableName)
 	}
+	m.insertSQL = fmt.Sprintf(sqltemplates.MetricsTimeSeriesInsert, m.database, m.tableName, samplesColumn)
 
 	switch {
 	case hasColumn(columnSet, "metric_family"):
@@ -116,7 +120,7 @@ func hasColumn(columnSet map[string]struct{}, name string) bool {
 type timeSeriesRow struct {
 	metricName string
 	tags       map[string]string
-	// samples is the value for the time_series Array(Tuple(DateTime64(3), Float64)) column.
+	// samples is the value for the outer Array(Tuple(DateTime64(3), Float64)) column.
 	samples [][]any
 }
 
