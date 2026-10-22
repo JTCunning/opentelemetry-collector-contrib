@@ -8,9 +8,11 @@ import (
 	sqldriver "database/sql/driver"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
+	"github.com/ClickHouse/clickhouse-go/v2/lib/column"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.uber.org/zap"
@@ -206,7 +208,7 @@ func (m *TimeSeriesModel) Insert(ctx context.Context, db driver.Conn, md pmetric
 			return fmt.Errorf("prepare TimeSeries samples batch: %w", batchErr)
 		}
 		for _, row := range rows {
-			if appendErr := batch.Append(row.metricName, row.tags, row.samples); appendErr != nil {
+			if appendErr := batch.Append(row.metricName, newSortedTags(row.tags), row.samples); appendErr != nil {
 				return fmt.Errorf("append TimeSeries samples row: %w", appendErr)
 			}
 		}
@@ -232,3 +234,38 @@ func (m *TimeSeriesModel) Insert(ctx context.Context, db driver.Conn, md pmetric
 
 	return nil
 }
+
+// sortedTags yields map keys in sorted order so the driver encodes a stable column.
+type sortedTags struct {
+	keys   []string
+	values []string
+	index  int
+}
+
+func newSortedTags(tags map[string]string) *sortedTags {
+	keys := make([]string, 0, len(tags))
+	for key := range tags {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	values := make([]string, len(keys))
+	for i, key := range keys {
+		values[i] = tags[key]
+	}
+	return &sortedTags{keys: keys, values: values, index: -1}
+}
+
+func (s *sortedTags) Put(any, any) {}
+
+func (s *sortedTags) Iterator() column.MapIterator {
+	s.index = -1
+	return s
+}
+
+func (s *sortedTags) Next() bool {
+	s.index++
+	return s.index < len(s.keys)
+}
+
+func (s *sortedTags) Key() any   { return s.keys[s.index] }
+func (s *sortedTags) Value() any { return s.values[s.index] }

@@ -56,6 +56,17 @@ func TestTimeSeriesModelSetColumns(t *testing.T) {
 	assert.Empty(t, m.metaInsertSQL)
 }
 
+func TestSortedTagsOrder(t *testing.T) {
+	iter := newSortedTags(map[string]string{"z": "1", "a": "2", "m": "3"}).Iterator()
+	var keys, values []string
+	for iter.Next() {
+		keys = append(keys, iter.Key().(string))
+		values = append(values, iter.Value().(string))
+	}
+	assert.Equal(t, []string{"a", "m", "z"}, keys)
+	assert.Equal(t, []string{"2", "3", "1"}, values)
+}
+
 func buildTimeSeriesTestMetrics(ts time.Time) pmetric.Metrics {
 	md := pmetric.NewMetrics()
 	rm := md.ResourceMetrics().AppendEmpty()
