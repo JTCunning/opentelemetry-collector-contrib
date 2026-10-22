@@ -5,8 +5,10 @@ package metrics // import "github.com/open-telemetry/opentelemetry-collector-con
 
 import (
 	"context"
+	sqldriver "database/sql/driver"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
@@ -145,12 +147,29 @@ func hasColumn(columnSet map[string]struct{}, name string) bool {
 	return ok
 }
 
+// sample is one element of Array(Tuple(DateTime64(3), Float64)).
+type sample struct {
+	ts    time.Time
+	value float64
+}
+
+// sampleColumn is the samples value passed to the driver.
+// Value runs only while the driver encodes the batch.
+type sampleColumn []sample
+
+func (s sampleColumn) Value() (sqldriver.Value, error) {
+	out := make([][]any, len(s))
+	for i, point := range s {
+		out[i] = []any{point.ts, point.value}
+	}
+	return out, nil
+}
+
 // timeSeriesRow is one row of the TimeSeries table's samples/tags insert.
 type timeSeriesRow struct {
 	metricName string
 	tags       map[string]string
-	// samples is the value for the outer Array(Tuple(DateTime64(3), Float64)) column.
-	samples [][]any
+	samples    sampleColumn
 }
 
 // metadataRow is one row of the TimeSeries table's metrics-metadata insert.

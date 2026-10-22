@@ -144,7 +144,8 @@ func TestToTimeSeriesRows(t *testing.T) {
 	assert.Equal(t, "test-service", gaugeRows[0].tags["job"])
 	assert.Equal(t, "instance-1", gaugeRows[0].tags["instance"])
 	require.Len(t, gaugeRows[0].samples, 1)
-	assert.Equal(t, []any{ts, 1.5}, gaugeRows[0].samples[0])
+	assert.Equal(t, ts, gaugeRows[0].samples[0].ts)
+	assert.Equal(t, 1.5, gaugeRows[0].samples[0].value)
 
 	// Monotonic cumulative sum becomes a counter with the _total suffix.
 	require.Len(t, byName["test_requests_total"], 1)
@@ -168,6 +169,40 @@ func TestToTimeSeriesRows(t *testing.T) {
 	for name := range byName {
 		assert.NotContains(t, name, "test_exp_latency")
 	}
+}
+
+func TestSampleColumnValue(t *testing.T) {
+	ts := time.UnixMilli(1700000000000).UTC()
+	column := sampleColumn{{ts: ts, value: 1.5}}
+	got, err := column.Value()
+	require.NoError(t, err)
+	assert.Equal(t, [][]any{{ts, 1.5}}, got)
+}
+
+func TestToTimeSeriesRowsMergesMatchingSeries(t *testing.T) {
+	SetLogger(zap.NewNop())
+
+	ts := time.UnixMilli(1700000000000).UTC()
+	md := pmetric.NewMetrics()
+	sm := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty()
+	gauge := sm.Metrics().AppendEmpty()
+	gauge.SetName("test.gauge")
+	points := gauge.SetEmptyGauge().DataPoints()
+	first := points.AppendEmpty()
+	first.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+	first.SetDoubleValue(1)
+	first.Attributes().PutStr("attr", "same")
+	second := points.AppendEmpty()
+	second.SetTimestamp(pcommon.NewTimestampFromTime(ts.Add(time.Second)))
+	second.SetDoubleValue(2)
+	second.Attributes().PutStr("attr", "same")
+
+	rows, _, _, _, err := convertToTimeSeries(md)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.Len(t, rows[0].samples, 2)
+	assert.Equal(t, 1.0, rows[0].samples[0].value)
+	assert.Equal(t, 2.0, rows[0].samples[1].value)
 }
 
 func TestToMetadataRows(t *testing.T) {
@@ -270,10 +305,10 @@ func TestConvertUnitScopeStaleAndInt(t *testing.T) {
 	assert.Equal(t, "scope-a", gaugeRow.tags["otel_scope_name"])
 	assert.Equal(t, "v1", gaugeRow.tags["otel_scope_version"])
 	require.Len(t, gaugeRow.samples, 1)
-	assert.Equal(t, float64(21), gaugeRow.samples[0][1])
+	assert.Equal(t, float64(21), gaugeRow.samples[0].value)
 
 	require.Contains(t, byName, "smoke_latency_seconds_bucket")
-	assert.Equal(t, math.Float64bits(staleNaN), math.Float64bits(byName["smoke_latency_seconds_sum"].samples[0][1].(float64)))
+	assert.Equal(t, math.Float64bits(staleNaN), math.Float64bits(byName["smoke_latency_seconds_sum"].samples[0].value))
 	require.Contains(t, byName, "queue_size")
 	assert.NotContains(t, byName, "queue_size_total")
 	assert.Equal(t, "host-a", byName["target_info"].tags["host_name"])

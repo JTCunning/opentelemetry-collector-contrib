@@ -5,6 +5,7 @@ package metrics // import "github.com/open-telemetry/opentelemetry-collector-con
 
 import (
 	"errors"
+	"hash/maphash"
 	"maps"
 	"math"
 	"slices"
@@ -34,13 +35,38 @@ const (
 // staleNaN is the Prometheus stale marker.
 var staleNaN = math.Float64frombits(0x7ff0000000000002)
 
+type nameKey struct {
+	name string
+	unit string
+	typ  otlptranslator.MetricType
+}
+
+type labelPair struct {
+	key   string
+	value string
+}
+
+type overflowSeries struct {
+	sum uint64
+	row *timeSeriesRow
+}
+
+var hashSep = []byte{0}
+
 type tsConverter struct {
 	metricNamer otlptranslator.MetricNamer
 	labelNamer  otlptranslator.LabelNamer
 	unitNamer   otlptranslator.UnitNamer
 
-	series map[string]*timeSeriesRow
-	order  []string
+	hasher     maphash.Hash
+	series     map[uint64]*timeSeriesRow
+	overflow   []overflowSeries
+	order      []*timeSeriesRow
+	keyScratch []string
+	pairs      []labelPair
+
+	names      map[nameKey]string
+	labelCache map[string]string
 
 	meta     []metadataRow
 	seenMeta map[string]struct{}
@@ -51,14 +77,18 @@ type tsConverter struct {
 }
 
 func newTSConverter() *tsConverter {
-	return &tsConverter{
+	c := &tsConverter{
 		metricNamer: otlptranslator.MetricNamer{WithMetricSuffixes: true},
 		//nolint:staticcheck // SA1019 UnderscoreLabelSanitization matches the Prometheus label rules this exporter follows.
 		labelNamer: otlptranslator.LabelNamer{UnderscoreLabelSanitization: true},
 		unitNamer:  otlptranslator.UnitNamer{},
-		series:     map[string]*timeSeriesRow{},
+		series:     map[uint64]*timeSeriesRow{},
+		names:      map[nameKey]string{},
+		labelCache: map[string]string{},
 		seenMeta:   map[string]struct{}{},
 	}
+	c.hasher.SetSeed(maphash.MakeSeed())
+	return c
 }
 
 // convertToTimeSeries walks OTel metrics and returns Prometheus-shaped samples
@@ -67,9 +97,9 @@ func newTSConverter() *tsConverter {
 func convertToTimeSeries(md pmetric.Metrics) (rows []timeSeriesRow, meta []metadataRow, droppedExp, droppedDelta int, err error) {
 	c := newTSConverter()
 	c.convert(md)
-	rows = make([]timeSeriesRow, 0, len(c.order))
-	for _, key := range c.order {
-		rows = append(rows, *c.series[key])
+	rows = make([]timeSeriesRow, len(c.order))
+	for i, row := range c.order {
+		rows[i] = *row
 	}
 	return rows, c.meta, c.droppedExp, c.droppedDelta, c.err
 }
@@ -108,7 +138,7 @@ func (c *tsConverter) addMetric(resource pcommon.Resource, scope pcommon.Instrum
 	if !ok {
 		return
 	}
-	name, err := c.metricNamer.Build(promMetric)
+	name, err := c.prometheusName(promMetric)
 	if err != nil {
 		c.err = errors.Join(c.err, err)
 		return
@@ -262,11 +292,7 @@ func (c *tsConverter) addTargetInfo(resource pcommon.Resource, ts pcommon.Timest
 }
 
 func (c *tsConverter) seriesTags(resource pcommon.Resource, attrs pcommon.Map, scope pcommon.InstrumentationScope, ignore ...string) map[string]string {
-	type pair struct {
-		key   string
-		value string
-	}
-	pairs := make([]pair, 0, attrs.Len())
+	c.pairs = c.pairs[:0]
 	attrs.Range(func(key string, value pcommon.Value) bool {
 		if slices.Contains(ignore, key) {
 			return true
@@ -275,14 +301,14 @@ func (c *tsConverter) seriesTags(resource pcommon.Resource, attrs pcommon.Map, s
 		if str == "" {
 			return true
 		}
-		pairs = append(pairs, pair{key: key, value: str})
+		c.pairs = append(c.pairs, labelPair{key: key, value: str})
 		return true
 	})
-	sort.Slice(pairs, func(i, j int) bool { return pairs[i].key < pairs[j].key })
+	sort.Slice(c.pairs, func(i, j int) bool { return c.pairs[i].key < c.pairs[j].key })
 
-	tags := make(map[string]string, len(pairs)+4)
-	for _, p := range pairs {
-		sanitized, err := c.labelNamer.Build(p.key)
+	tags := make(map[string]string, len(c.pairs)+4)
+	for _, p := range c.pairs {
+		sanitized, err := c.sanitizeLabel(p.key)
 		if err != nil {
 			c.err = errors.Join(c.err, err)
 			continue
@@ -317,45 +343,87 @@ func (c *tsConverter) addSample(name string, tags map[string]string, ts time.Tim
 	if name == "" {
 		return
 	}
-	key := seriesKey(name, tags)
-	row := c.series[key]
-	if row == nil {
-		row = &timeSeriesRow{
-			metricName: name,
-			tags:       tags,
-			samples:    make([][]any, 0, 1),
-		}
-		c.series[key] = row
-		c.order = append(c.order, key)
+	sum := c.hashSeries(name, tags)
+	if row := c.lookup(sum, name, tags); row != nil {
+		row.samples = append(row.samples, sample{ts: ts, value: value})
+		return
 	}
-	row.samples = append(row.samples, []any{ts, value})
+	row := &timeSeriesRow{
+		metricName: name,
+		tags:       tags,
+		samples:    sampleColumn{{ts: ts, value: value}},
+	}
+	if _, occupied := c.series[sum]; occupied {
+		c.overflow = append(c.overflow, overflowSeries{sum: sum, row: row})
+	} else {
+		c.series[sum] = row
+	}
+	c.order = append(c.order, row)
+}
+
+func (c *tsConverter) lookup(sum uint64, name string, tags map[string]string) *timeSeriesRow {
+	if row := c.series[sum]; row != nil && sameSeries(row, name, tags) {
+		return row
+	}
+	for i := range c.overflow {
+		if c.overflow[i].sum == sum && sameSeries(c.overflow[i].row, name, tags) {
+			return c.overflow[i].row
+		}
+	}
+	return nil
+}
+
+func sameSeries(row *timeSeriesRow, name string, tags map[string]string) bool {
+	return row.metricName == name && maps.Equal(row.tags, tags)
+}
+
+func (c *tsConverter) hashSeries(name string, tags map[string]string) uint64 {
+	c.hasher.Reset()
+	_, _ = c.hasher.WriteString(name)
+	_, _ = c.hasher.Write(hashSep)
+	c.keyScratch = c.keyScratch[:0]
+	for key := range tags {
+		c.keyScratch = append(c.keyScratch, key)
+	}
+	sort.Strings(c.keyScratch)
+	for _, key := range c.keyScratch {
+		_, _ = c.hasher.WriteString(key)
+		_, _ = c.hasher.Write(hashSep)
+		_, _ = c.hasher.WriteString(tags[key])
+		_, _ = c.hasher.Write(hashSep)
+	}
+	return c.hasher.Sum64()
+}
+
+func (c *tsConverter) prometheusName(metric otlptranslator.Metric) (string, error) {
+	key := nameKey{name: metric.Name, unit: metric.Unit, typ: metric.Type}
+	if name, ok := c.names[key]; ok {
+		return name, nil
+	}
+	name, err := c.metricNamer.Build(metric)
+	if err != nil {
+		return "", err
+	}
+	c.names[key] = name
+	return name, nil
+}
+
+func (c *tsConverter) sanitizeLabel(key string) (string, error) {
+	if sanitized, ok := c.labelCache[key]; ok {
+		return sanitized, nil
+	}
+	sanitized, err := c.labelNamer.Build(key)
+	if err != nil {
+		return "", err
+	}
+	c.labelCache[key] = sanitized
+	return sanitized, nil
 }
 
 func withLabel(tags map[string]string, key, value string) map[string]string {
 	out := maps.Clone(tags)
 	out[key] = value
 	return out
-}
-
-func seriesKey(name string, tags map[string]string) string {
-	keys := make([]string, 0, len(tags))
-	for key := range tags {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	size := len(name)
-	for _, key := range keys {
-		size += 2 + len(key) + len(tags[key])
-	}
-	buf := make([]byte, 0, size)
-	buf = append(buf, name...)
-	for _, key := range keys {
-		buf = append(buf, 0)
-		buf = append(buf, key...)
-		buf = append(buf, 0)
-		buf = append(buf, tags[key]...)
-	}
-	return string(buf)
 }
 
 func staleOr(stale bool, value float64) float64 {
