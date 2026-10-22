@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
@@ -80,6 +81,16 @@ type TimeSeriesModel struct {
 
 	insertSQL     string
 	metaInsertSQL string
+
+	metaMu    sync.Mutex
+	metaCache map[string]metaIdentity
+}
+
+// metaIdentity is the metadata already sent for one metric family.
+type metaIdentity struct {
+	metricType string
+	unit       string
+	help       string
 }
 
 // NewTimeSeriesModel creates a TimeSeriesModel writing to the given table.
@@ -88,6 +99,7 @@ func NewTimeSeriesModel(database, tableName string) *TimeSeriesModel {
 	return &TimeSeriesModel{
 		database:  database,
 		tableName: tableName,
+		metaCache: map[string]metaIdentity{},
 	}
 }
 
@@ -182,8 +194,8 @@ type metadataRow struct {
 	help         string
 }
 
-// Insert translates the given metrics and writes them with two batches: one
-// for samples+tags, one for metric metadata.
+// Insert translates the given metrics and writes samples plus any metadata
+// rows this process has not already stored.
 func (m *TimeSeriesModel) Insert(ctx context.Context, db driver.Conn, md pmetric.Metrics) error {
 	if m.insertSQL == "" {
 		return errors.New("TimeSeries model not initialized: DetectSchema was not called")
@@ -217,12 +229,13 @@ func (m *TimeSeriesModel) Insert(ctx context.Context, db driver.Conn, md pmetric
 		}
 	}
 
-	if len(metaRows) > 0 && m.metaInsertSQL != "" {
+	pending := m.unseenMeta(metaRows)
+	if len(pending) > 0 && m.metaInsertSQL != "" {
 		batch, batchErr := db.PrepareBatch(ctx, m.metaInsertSQL)
 		if batchErr != nil {
 			return fmt.Errorf("prepare TimeSeries metadata batch: %w", batchErr)
 		}
-		for _, row := range metaRows {
+		for _, row := range pending {
 			if appendErr := batch.Append(row.metricFamily, row.metricType, row.unit, row.help); appendErr != nil {
 				return fmt.Errorf("append TimeSeries metadata row: %w", appendErr)
 			}
@@ -230,9 +243,37 @@ func (m *TimeSeriesModel) Insert(ctx context.Context, db driver.Conn, md pmetric
 		if sendErr := batch.Send(); sendErr != nil {
 			return fmt.Errorf("send TimeSeries metadata batch: %w", sendErr)
 		}
+		m.rememberMeta(pending)
 	}
 
 	return nil
+}
+
+// unseenMeta returns metadata rows whose family is new or whose type, unit, or help changed.
+func (m *TimeSeriesModel) unseenMeta(rows []metadataRow) []metadataRow {
+	m.metaMu.Lock()
+	defer m.metaMu.Unlock()
+	pending := make([]metadataRow, 0, len(rows))
+	for _, row := range rows {
+		prev, ok := m.metaCache[row.metricFamily]
+		if ok && prev == metaIdentityOf(row) {
+			continue
+		}
+		pending = append(pending, row)
+	}
+	return pending
+}
+
+func (m *TimeSeriesModel) rememberMeta(rows []metadataRow) {
+	m.metaMu.Lock()
+	defer m.metaMu.Unlock()
+	for _, row := range rows {
+		m.metaCache[row.metricFamily] = metaIdentityOf(row)
+	}
+}
+
+func metaIdentityOf(row metadataRow) metaIdentity {
+	return metaIdentity{metricType: row.metricType, unit: row.unit, help: row.help}
 }
 
 // sortedTags yields map keys in sorted order so the driver encodes a stable column.

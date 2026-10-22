@@ -67,6 +67,27 @@ func TestSortedTagsOrder(t *testing.T) {
 	assert.Equal(t, []string{"2", "3", "1"}, values)
 }
 
+func TestMetadataCache(t *testing.T) {
+	m := NewTimeSeriesModel("otel", "otel_metrics")
+	rows := []metadataRow{
+		{metricFamily: "requests", metricType: "counter", unit: "1", help: "count"},
+		{metricFamily: "temperature", metricType: "gauge", unit: "Cel", help: "temp"},
+	}
+
+	assert.Equal(t, rows, m.unseenMeta(rows))
+	m.rememberMeta(rows)
+	assert.Empty(t, m.unseenMeta(rows))
+
+	changed := []metadataRow{
+		{metricFamily: "requests", metricType: "counter", unit: "s", help: "count"},
+		{metricFamily: "temperature", metricType: "gauge", unit: "Cel", help: "temp"},
+	}
+	got := m.unseenMeta(changed)
+	require.Len(t, got, 1)
+	assert.Equal(t, "requests", got[0].metricFamily)
+	assert.Equal(t, "s", got[0].unit)
+}
+
 func buildTimeSeriesTestMetrics(ts time.Time) pmetric.Metrics {
 	md := pmetric.NewMetrics()
 	rm := md.ResourceMetrics().AppendEmpty()
